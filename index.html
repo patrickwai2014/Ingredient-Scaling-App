@@ -187,6 +187,19 @@
     .grabber { display: none; }
   }
 
+
+  /* Account / sign-in */
+  .cell .lbl-fixed { flex: none; width: 92px; }
+  html[lang="zh-Hant"] .cell .lbl-fixed { width: 80px; }
+  label.cell { cursor: text; }
+  .auth-actions { margin: 24px 16px 18px; }
+  .filled-btn.block { width: 100%; justify-content: center; gap: 10px; }
+  .filled-btn[disabled] { opacity: .6; }
+  .spinner.sm { width: 18px; height: 18px; margin: 0; border-color: rgba(255,255,255,.35); border-top-color: #fff; }
+  .auth-switch { text-align: center; color: var(--label2); font-size: 15px; letter-spacing: -0.24px; margin: 0 16px; }
+  .auth-switch .nav-btn { font-size: 15px; padding: 6px 4px; }
+  .account-head { text-align: center; padding: 8px 0 22px; color: var(--label3); }
+  .account-name { color: var(--label); font-size: 22px; font-weight: 600; margin-top: 6px; letter-spacing: .35px; }
   .file-btn { color: var(--tint); }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
   :focus-visible { outline: 2px solid var(--tint); outline-offset: 2px; border-radius: 6px; }
@@ -220,6 +233,18 @@
 <script>
 (function () {
   "use strict";
+
+  /* =====================================================================
+     FIREBASE SETTINGS — paste your Firebase web app config here to turn on
+     user accounts and syncing across devices. Leave as null to keep
+     recipes in this browser only.
+     Example:
+       const FIREBASE_CONFIG = {
+         apiKey: "...", authDomain: "...", projectId: "...",
+         storageBucket: "...", messagingSenderId: "...", appId: "..."
+       };
+     ===================================================================== */
+  const FIREBASE_CONFIG = null;
 
   /* ---------------- Translations ---------------- */
   const I18N = {
@@ -460,7 +485,8 @@
 
   /* ---------------- State ---------------- */
   const state = {
-    view: "list",       // list | edit | calc
+    view: "boot",       // boot | auth | list | edit | calc
+    auth: { mode: "signin", username: "", error: "", busy: false },
     recipes: [],
     loaded: false,
     slow: false,
@@ -503,6 +529,10 @@
     return window.claude;
   }
 
+  function firebaseConfigured() {
+    return !!(FIREBASE_CONFIG && FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId);
+  }
+
   async function initStorage() {
     if (inFrame()) {
       const c = await waitForClaude(3000);
@@ -513,6 +543,9 @@
           if (db && uid) { startCloud(db, uid); return; }
         } catch (e) { /* fall back to local */ }
       }
+    } else if (firebaseConfigured()) {
+      startFirebase();
+      return;
     }
     startLocal();
   }
@@ -527,11 +560,180 @@
       state.recipes = arr;
     }
     state.loaded = true;
+    if (state.view === "boot" || state.view === "auth") { state.view = "list"; render(); }
     renderStorageNote();
     onRecipesChanged();
   }
 
+  /* ---------- Firebase: username + password accounts, synced recipes ---------- */
+  const FB_VERSION = "10.12.2";
+  const USER_EMAIL_DOMAIN = "ingcalc.example.com"; // usernames are stored as <username>@this-domain
+  const FB = { mod: null, auth: null, db: null, user: null, unsub: null };
+  const USERNAME_RE = /^[a-z0-9._-]{3,20}$/;
+  const MIGRATE_KEY = "ingcalc.migrated.";
+  const usernameToEmail = u => u + "@" + USER_EMAIL_DOMAIN;
+  const currentUsername = () => FB.user ? String(FB.user.email || "").split("@")[0] : "";
+
+  async function startFirebase() {
+    try {
+      const base = "https://www.gstatic.com/firebasejs/" + FB_VERSION + "/";
+      const [appM, authM, fsM] = await Promise.all([
+        import(base + "firebase-app.js"),
+        import(base + "firebase-auth.js"),
+        import(base + "firebase-firestore.js")
+      ]);
+      FB.mod = Object.assign({}, appM, authM, fsM);
+      const app = appM.initializeApp(FIREBASE_CONFIG);
+      FB.auth = authM.getAuth(app);
+      try {
+        // keeps recipes available offline and makes loading instant
+        FB.db = fsM.initializeFirestore(app, { localCache: fsM.persistentLocalCache({ tabManager: fsM.persistentMultipleTabManager() }) });
+      } catch (e) {
+        FB.db = fsM.getFirestore(app);
+      }
+    } catch (e) {
+      console.error("Firebase failed to load", e);
+      toast(t("fbLoadErr"), true);
+      startLocal();
+      return;
+    }
+    Store.mode = "firebase";
+    FB.mod.onAuthStateChanged(FB.auth, onFirebaseUser);
+  }
+
+  function onFirebaseUser(user) {
+    if (FB.unsub) { FB.unsub(); FB.unsub = null; }
+    FB.user = user;
+    state.recipes = [];
+    state.loaded = false;
+    state.loadError = false;
+    state.slow = false;
+    if (!user) {
+      if (!$("#overlay").hidden) closeModal();
+      state.view = "auth";
+      state.auth.busy = false;
+      render();
+      return;
+    }
+    state.auth = { mode: "signin", username: "", error: "", busy: false };
+    state.view = "list";
+    state.query = "";
+    render();
+    window.scrollTo(0, 0);
+    const col = FB.mod.collection(FB.db, "users", user.uid, "recipes");
+    const timer = setTimeout(() => { if (!state.loaded) { state.slow = true; onRecipesChanged(); } }, 10000);
+    let migrationChecked = false;
+    FB.unsub = FB.mod.onSnapshot(col, snap => {
+      state.recipes = snap.docs.map(d => normalize(Object.assign({}, d.data(), { id: d.id }))).filter(Boolean);
+      state.loaded = true;
+      if (!snap.metadata.fromCache) {
+        clearTimeout(timer);
+        state.slow = false;
+        if (!migrationChecked) { migrationChecked = true; setTimeout(maybeOfferMigration, 300); }
+      }
+      onRecipesChanged();
+    }, err => {
+      console.error(err);
+      clearTimeout(timer);
+      state.loaded = true;
+      state.slow = false;
+      state.loadError = true;
+      onRecipesChanged();
+    });
+  }
+
+  function authErrorMsg(e) {
+    const c = (e && e.code) || "";
+    if (c === "auth/email-already-in-use") return t("errTaken");
+    if (c === "auth/invalid-credential" || c === "auth/wrong-password" || c === "auth/user-not-found" || c === "auth/invalid-login-credentials") return t("errLogin");
+    if (c === "auth/weak-password") return t("errPassword");
+    if (c === "auth/too-many-requests") return t("errTooMany");
+    if (c === "auth/network-request-failed") return t("errNetwork");
+    if (c === "auth/invalid-email") return t("errUsername");
+    if (c === "auth/operation-not-allowed" || c === "auth/configuration-not-found") return t("errNotEnabled");
+    return t("errAuth");
+  }
+
+  async function submitAuth() {
+    const a = state.auth;
+    if (a.busy) return;
+    const username = ($("#aUser").value || "").trim().toLowerCase();
+    const pw = $("#aPass").value || "";
+    const confirm = a.mode === "signup" ? ($("#aConfirm").value || "") : pw;
+    a.username = username;
+    let err = "";
+    if (!USERNAME_RE.test(username)) err = t("errUsername");
+    else if (pw.length < 6) err = a.mode === "signup" ? t("errPassword") : t("errLogin");
+    else if (pw !== confirm) err = t("errConfirm");
+    if (err) { a.error = err; render(); focusAuthField(); return; }
+    a.error = ""; a.busy = true; render();
+    try {
+      const email = usernameToEmail(username);
+      if (a.mode === "signup") await FB.mod.createUserWithEmailAndPassword(FB.auth, email, pw);
+      else await FB.mod.signInWithEmailAndPassword(FB.auth, email, pw);
+      // onAuthStateChanged takes it from here
+    } catch (e) {
+      a.busy = false;
+      a.error = authErrorMsg(e);
+      render();
+      focusAuthField();
+    }
+  }
+  function focusAuthField() {
+    const u = $("#aUser");
+    if (u && !u.value) { u.focus(); return; }
+    const p = $("#aPass"); if (p) p.focus();
+  }
+
+  function maybeOfferMigration() {
+    if (Store.mode !== "firebase" || !FB.user) return;
+    const local = lsRead();
+    if (!local || !local.length) return;
+    try { if (localStorage.getItem(MIGRATE_KEY + FB.user.uid)) return; } catch (e) { return; }
+    if (!$("#overlay").hidden || state.view === "edit") return;
+    openModal(`
+      <div class="action-sheet">
+        <div class="action-group">
+          <div class="action-head"><strong>${esc(t("migrateTitle"))}</strong>${esc(t("migrateBody", local.length))}</div>
+          <button class="action-btn after-head" data-action="migrate-yes">${esc(t("migrateYes"))}</button>
+        </div>
+        <div class="action-group"><button class="action-btn cancel" data-action="migrate-no">${esc(t("migrateNo"))}</button></div>
+      </div>`);
+  }
+  async function migrateLocal(yes) {
+    closeModal();
+    if (!FB.user) return;
+    try { localStorage.setItem(MIGRATE_KEY + FB.user.uid, "1"); } catch (e) {}
+    if (!yes) return;
+    const local = lsRead() || [];
+    for (const r of local) { await saveRecipe(r); }
+    try { localStorage.removeItem(LS_KEY); } catch (e) {}
+    toast(t("importDone", local.length));
+  }
+
+  async function doChangePassword() {
+    const cur = $("#pwCur").value || "", nw = $("#pwNew").value || "", cf = $("#pwConfirm").value || "";
+    const errEl = $("#pwError");
+    const show = m => { errEl.textContent = m; errEl.hidden = !m; };
+    if (nw.length < 6) return show(t("errPassword"));
+    if (nw !== cf) return show(t("errConfirm"));
+    const btn = document.querySelector('#modal [data-action="do-change-pw"]');
+    if (btn) btn.disabled = true;
+    try {
+      const cred = FB.mod.EmailAuthProvider.credential(FB.user.email, cur);
+      await FB.mod.reauthenticateWithCredential(FB.user, cred);
+      await FB.mod.updatePassword(FB.user, nw);
+      closeModal();
+      toast(t("pwChanged"));
+    } catch (e) {
+      if (btn) btn.disabled = false;
+      const c = e && e.code;
+      show((c === "auth/invalid-credential" || c === "auth/wrong-password") ? t("errCurrentPw") : authErrorMsg(e));
+    }
+  }
+
   function startCloud(db, uid) {
+    if (state.view === "boot") state.view = "list";
     Store.mode = "cloud";
     Store.col = db.collection("data/users/" + uid);
     renderStorageNote();
@@ -556,6 +758,11 @@
     if (i >= 0) state.recipes[i] = r; else state.recipes.push(r);
     if (Store.mode === "cloud") {
       await Store.col.doc(r.id).set(r);
+    } else if (Store.mode === "firebase") {
+      if (!FB.user) throw { code: "auth" };
+      // Firestore applies the write locally at once and syncs in the background (works offline too)
+      FB.mod.setDoc(FB.mod.doc(FB.db, "users", FB.user.uid, "recipes", r.id), r)
+        .catch(e => { console.error(e); toast(t("saveErr"), true); });
     } else if (Store.mode === "local") {
       if (!lsWrite(state.recipes)) throw { code: "local" };
     }
@@ -564,6 +771,10 @@
     state.recipes = state.recipes.filter(x => x.id !== id);
     if (Store.mode === "cloud") {
       await Store.col.doc(id).delete();
+    } else if (Store.mode === "firebase") {
+      if (!FB.user) throw { code: "auth" };
+      FB.mod.deleteDoc(FB.mod.doc(FB.db, "users", FB.user.uid, "recipes", id))
+        .catch(e => { console.error(e); toast(t("saveErr"), true); });
     } else if (Store.mode === "local") {
       if (!lsWrite(state.recipes)) throw { code: "local" };
     }
@@ -574,9 +785,12 @@
 
   function renderStorageNote() {
     const el = $("#storageNote");
-    if (!Store.mode) { el.hidden = true; return; }
+    if (!Store.mode || state.view === "auth" || state.view === "boot" || (Store.mode === "firebase" && !FB.user)) { el.hidden = true; return; }
     el.hidden = false;
-    $("#storageText").textContent = Store.mode === "cloud" ? t("storageCloud") : Store.mode === "local" ? t("storageLocal") : t("storageNone");
+    $("#storageText").textContent =
+      Store.mode === "firebase" ? t("storageFb", currentUsername()) :
+      Store.mode === "cloud" ? t("storageCloud") :
+      Store.mode === "local" ? t("storageLocal") : t("storageNone");
   }
 
   /* ---------------- Toast ---------------- */
@@ -638,6 +852,129 @@
     book: '<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h7M9 11h5"/></svg>'
   };
 
+  ICON.person = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><circle cx="12" cy="10" r="3.2"/><path d="M6 18.5c1.4-2.2 3.6-3.3 6-3.3s4.6 1.1 6 3.3"/></svg>';
+
+  /* ---------------- Account strings ---------------- */
+  Object.assign(I18N.en, {
+    signIn: "Sign In", createAccount: "Create Account",
+    username: "Username", password: "Password", confirmPassword: "Confirm",
+    usernamePh: "e.g. patrick", passwordPh: "Required", newPasswordPh: "At least 6 characters", confirmPh: "Type it again",
+    authSub: "Sign in to see your recipes on all your devices.",
+    noAccount: "Don’t have an account?", haveAccount: "Already have an account?",
+    createOne: "Create one", signInLink: "Sign in",
+    usernameHint: "Username: 3–20 letters, numbers, dot, dash or underscore. Password: at least 6 characters.",
+    noResetWarn: "Keep your password safe — it can’t be reset if you forget it.",
+    errUsername: "Username must be 3–20 characters: letters, numbers, . _ or -",
+    errPassword: "Password must be at least 6 characters.",
+    errConfirm: "The passwords don’t match.",
+    errTaken: "That username is already taken. Please choose another.",
+    errLogin: "Wrong username or password.",
+    errTooMany: "Too many attempts. Please wait a few minutes and try again.",
+    errNetwork: "No internet connection. Please check and try again.",
+    errNotEnabled: "Sign-in isn’t switched on yet. In Firebase, enable Email/Password sign-in.",
+    errAuth: "Something went wrong. Please try again.",
+    signingIn: "Signing in…", creating: "Creating account…",
+    account: "Account", signedInAs: "Signed in as", changePassword: "Change Password", signOut: "Sign Out",
+    currentPassword: "Current", newPassword: "New",
+    pwChanged: "Password changed", errCurrentPw: "Your current password is wrong.",
+    storageFb: u => `Signed in as ${u}. Your recipes sync to every device where you sign in.`,
+    migrateTitle: "Recipes on this device",
+    migrateBody: n => `${n === 1 ? "1 recipe is" : n + " recipes are"} saved on this device only. Add ${n === 1 ? "it" : "them"} to your account so ${n === 1 ? "it syncs" : "they sync"} everywhere?`,
+    migrateYes: "Add to My Account", migrateNo: "Not Now",
+    fbLoadErr: "Couldn’t connect to the sign-in service. Recipes will be saved on this device for now."
+  });
+  Object.assign(I18N.zh, {
+    signIn: "登入", createAccount: "建立帳戶",
+    username: "用戶名稱", password: "密碼", confirmPassword: "確認密碼",
+    usernamePh: "例如：patrick", passwordPh: "必填", newPasswordPh: "最少 6 個字元", confirmPh: "再輸入一次",
+    authSub: "登入後即可在所有裝置查看你的食譜。",
+    noAccount: "還沒有帳戶？", haveAccount: "已有帳戶？",
+    createOne: "立即建立", signInLink: "登入",
+    usernameHint: "用戶名稱：3–20 個英文字母、數字、點、連字號或底線。密碼：最少 6 個字元。",
+    noResetWarn: "請妥善保管密碼——忘記密碼後將無法重設。",
+    errUsername: "用戶名稱需為 3–20 個字元：英文字母、數字、. _ 或 -",
+    errPassword: "密碼最少需要 6 個字元。",
+    errConfirm: "兩次輸入的密碼不相符。",
+    errTaken: "此用戶名稱已被使用，請選擇其他名稱。",
+    errLogin: "用戶名稱或密碼錯誤。",
+    errTooMany: "嘗試次數過多，請稍等幾分鐘再試。",
+    errNetwork: "沒有網絡連線，請檢查後再試。",
+    errNotEnabled: "登入功能尚未啟用。請在 Firebase 啟用「電郵/密碼」登入。",
+    errAuth: "發生錯誤，請再試一次。",
+    signingIn: "正在登入……", creating: "正在建立帳戶……",
+    account: "帳戶", signedInAs: "已登入帳戶", changePassword: "更改密碼", signOut: "登出",
+    currentPassword: "目前密碼", newPassword: "新密碼",
+    pwChanged: "密碼已更改", errCurrentPw: "目前密碼不正確。",
+    storageFb: u => `已登入：${u}。你的食譜會同步到所有已登入的裝置。`,
+    migrateTitle: "此裝置上的食譜",
+    migrateBody: n => `有 ${n} 個食譜只儲存在此裝置。要加入你的帳戶，以便在所有裝置同步嗎？`,
+    migrateYes: "加入我的帳戶", migrateNo: "暫時不要",
+    fbLoadErr: "未能連接登入服務。食譜暫時會儲存在此裝置。"
+  });
+
+  function langSegHtml() {
+    return `<div class="segmented" role="group" aria-label="Language / 語言">
+        <button type="button" data-lang="en" aria-pressed="${lang === "en"}">EN</button>
+        <button type="button" data-lang="zh" aria-pressed="${lang === "zh"}">繁</button>
+      </div>`;
+  }
+
+  function viewAuth() {
+    const a = state.auth;
+    const signup = a.mode === "signup";
+    return nav("", "", langSegHtml()) + `
+      <h1 class="large-title">${esc(t("appTitle"))}</h1>
+      <p class="detail-sub" style="margin:0 20px 26px">${esc(t("authSub"))}</p>
+      <form id="authForm" novalidate>
+        <div class="section" style="margin-bottom:0">
+          <div class="section-header">${esc(signup ? t("createAccount") : t("signIn"))}</div>
+          <div class="group">
+            <label class="cell"><span class="lbl-fixed">${esc(t("username"))}</span>
+              <input class="field" id="aUser" value="${esc(a.username)}" placeholder="${esc(t("usernamePh"))}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="20" enterkeyhint="next"></label>
+            <label class="cell"><span class="lbl-fixed">${esc(t("password"))}</span>
+              <input class="field" id="aPass" type="password" placeholder="${esc(signup ? t("newPasswordPh") : t("passwordPh"))}" autocomplete="${signup ? "new-password" : "current-password"}" enterkeyhint="${signup ? "next" : "go"}"></label>
+            ${signup ? `<label class="cell"><span class="lbl-fixed">${esc(t("confirmPassword"))}</span>
+              <input class="field" id="aConfirm" type="password" placeholder="${esc(t("confirmPh"))}" autocomplete="new-password" enterkeyhint="go"></label>` : ""}
+          </div>
+          ${a.error ? `<div class="section-footer error" role="alert">${esc(a.error)}</div>` : ""}
+          ${signup ? `<div class="section-footer">${esc(t("usernameHint"))}<br>${esc(t("noResetWarn"))}</div>` : ""}
+        </div>
+        <div class="auth-actions">
+          <button type="submit" class="filled-btn block" ${a.busy ? "disabled" : ""}>${a.busy ? `<span class="spinner sm"></span>` : ""}${esc(a.busy ? (signup ? t("creating") : t("signingIn")) : (signup ? t("createAccount") : t("signIn")))}</button>
+        </div>
+        <p class="auth-switch">${esc(signup ? t("haveAccount") : t("noAccount"))}
+          <button type="button" class="nav-btn" data-action="toggle-auth">${esc(signup ? t("signInLink") : t("createOne"))}</button></p>
+      </form>`;
+  }
+
+  function openAccount() {
+    openModal(sheet("", t("account"), `<button class="nav-btn bold" data-action="close-modal">${esc(t("done"))}</button>`, `
+      <div class="account-head">${ICON.person.replace('width="24" height="24"', 'width="64" height="64"')}<div class="account-name">${esc(currentUsername())}</div></div>
+      <div class="section">
+        <div class="group"><button class="cell action" data-action="change-pw">${esc(t("changePassword"))}</button></div>
+      </div>
+      <div class="section">
+        <div class="group"><button class="cell destructive" data-action="sign-out">${esc(t("signOut"))}</button></div>
+        <div class="section-footer">${esc(t("storageFb", currentUsername()))}</div>
+      </div>`));
+  }
+
+  function openChangePassword() {
+    openModal(sheet(
+      `<button class="nav-btn" data-action="close-modal">${esc(t("cancel"))}</button>`,
+      t("changePassword"),
+      `<button class="nav-btn bold" data-action="do-change-pw">${esc(t("save"))}</button>`, `
+      <div class="section" style="margin-top:12px">
+        <div class="group">
+          <label class="cell"><span class="lbl-fixed">${esc(t("currentPassword"))}</span><input class="field" id="pwCur" type="password" autocomplete="current-password" placeholder="${esc(t("passwordPh"))}"></label>
+          <label class="cell"><span class="lbl-fixed">${esc(t("newPassword"))}</span><input class="field" id="pwNew" type="password" autocomplete="new-password" placeholder="${esc(t("newPasswordPh"))}"></label>
+          <label class="cell"><span class="lbl-fixed">${esc(t("confirmPassword"))}</span><input class="field" id="pwConfirm" type="password" autocomplete="new-password" placeholder="${esc(t("confirmPh"))}"></label>
+        </div>
+        <div class="section-footer error" id="pwError" role="alert" hidden></div>
+        <div class="section-footer">${esc(t("noResetWarn"))}</div>
+      </div>`));
+  }
+
   /* ---------------- Rendering ---------------- */
   function applyChrome() {
     document.documentElement.lang = lang === "zh" ? "zh-Hant" : "en";
@@ -655,7 +992,9 @@
   function render() {
     applyChrome();
     const v = $("#view");
-    if (state.view === "edit") v.innerHTML = viewEdit();
+    if (state.view === "boot") v.innerHTML = `<div class="loading" style="padding-top:120px"><div class="spinner"></div></div>`;
+    else if (state.view === "auth") v.innerHTML = viewAuth();
+    else if (state.view === "edit") v.innerHTML = viewEdit();
     else if (state.view === "calc") v.innerHTML = viewCalc();
     else v.innerHTML = viewList();
     if (state.view === "calc") updateCalcResults();
@@ -670,7 +1009,7 @@
 
   // Called whenever the recipe set changes (incl. live updates from another device)
   function onRecipesChanged() {
-    if (state.view === "edit") return; // never disturb a form being filled in
+    if (state.view === "edit" || state.view === "auth" || state.view === "boot") return; // never disturb a form being filled in
     if (state.view === "calc") {
       if (!getRecipe(state.calcId)) { state.view = "list"; render(); return; }
       if ($("#calcTarget")) { updateCalcResults(); return; }
@@ -691,7 +1030,8 @@
         <button type="button" data-lang="en" aria-pressed="${lang === "en"}">EN</button>
         <button type="button" data-lang="zh" aria-pressed="${lang === "zh"}">繁</button>
       </div>`;
-    const left = `<button class="nav-btn icon" id="backupBtn" aria-label="${esc(t("backup"))}" title="${esc(t("backup"))}">${ICON.share}</button>`;
+    const left = `<button class="nav-btn icon" id="backupBtn" aria-label="${esc(t("backup"))}" title="${esc(t("backup"))}">${ICON.share}</button>` +
+      (Store.mode === "firebase" && FB.user ? `<button class="nav-btn icon" data-action="account" aria-label="${esc(t("account"))}" title="${esc(t("account"))}">${ICON.person}</button>` : "");
     const right = `${langSeg}<button class="nav-btn icon" data-action="new" aria-label="${esc(t("newRecipe"))}" title="${esc(t("newRecipe"))}">${ICON.plus}</button>`;
     const head = nav(left, "", right) + `<h1 class="large-title">${esc(t("myRecipes"))}</h1>`;
 
@@ -1105,6 +1445,7 @@
     const langBtn = ev.target.closest("[data-lang]");
     if (langBtn) {
       if (state.view === "edit" && state.draft) readDraftFromForm();
+      if (state.view === "auth" && $("#aUser")) state.auth.username = $("#aUser").value;
       lang = langBtn.dataset.lang;
       try { localStorage.setItem(LANG_KEY, lang); } catch (e) {}
       render();
@@ -1163,6 +1504,19 @@
     else if (a === "download-export") downloadBackup();
     else if (a === "copy-export") copyExport();
     else if (a === "do-import") doImport();
+    else if (a === "toggle-auth") {
+      state.auth.username = ($("#aUser") && $("#aUser").value) || state.auth.username;
+      state.auth.mode = state.auth.mode === "signup" ? "signin" : "signup";
+      state.auth.error = "";
+      render();
+      focusAuthField();
+    }
+    else if (a === "account") openAccount();
+    else if (a === "change-pw") openChangePassword();
+    else if (a === "do-change-pw") doChangePassword();
+    else if (a === "sign-out") { closeModal(); if (FB.mod && FB.auth) FB.mod.signOut(FB.auth); }
+    else if (a === "migrate-yes") migrateLocal(true);
+    else if (a === "migrate-no") migrateLocal(false);
   });
 
   document.addEventListener("input", (ev) => {
@@ -1191,6 +1545,7 @@
 
   document.addEventListener("submit", (ev) => {
     if (ev.target.id === "editForm") { ev.preventDefault(); submitEdit(); }
+    if (ev.target.id === "authForm") { ev.preventDefault(); submitAuth(); }
   });
 
   document.addEventListener("keydown", (ev) => {
